@@ -1,0 +1,12 @@
+version: "3"
+
+services:
+  php-apache:
+    image: php:7.4-apache
+    restart: always
+    ports:
+      - 80:80
+    volumes:
+      - ./data:/var/www/html
+    environment:
+      - APACHE_DOCUMENT_ROOT=/var/www/html

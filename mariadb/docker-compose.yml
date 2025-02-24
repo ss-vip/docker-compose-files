@@ -1,0 +1,16 @@
+version: "3"
+
+networks:
+  mariadb:
+    external: false
+    
+services:
+  db:
+    image: mariadb
+    restart: always
+    volumes:
+      - ./data:/var/lib/mysql
+    ports:
+      - 33306:3306
+    environment:
+      - MARIADB_ROOT_PASSWORD=test
