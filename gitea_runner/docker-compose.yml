@@ -1,8 +1,6 @@
-version: "3"
-
 services:
   runner:
-    image: gitea/act_runner
+    image: gitea/runner:latest
     restart: always
     volumes:
       - ./data:/data
