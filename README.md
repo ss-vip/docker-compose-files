@@ -24,6 +24,8 @@ docker-compose up -d
 
 Semgrep + Trivy 輸出 SARIF，將 yaml 檔案存於 `.github\workflows` 路徑內使用，適合 Github、Gitea actions 使用。
 
+> 漏洞 + 密鑰 + IaC 掃描紀錄與合併阻擋
+
 ```yaml
 name: Security Audit to SARIF
 on: [push, pull_request]
@@ -43,16 +45,24 @@ jobs:
       - name: Install Semgrep
         run: pip install --break-system-packages --ignore-installed semgrep
 
+      # 顯示 log
+      - name: Show Semgrep Findings
+        run: semgrep scan --config="p/security-audit" --severity ERROR || true
+
       - name: Run Semgrep SAST
-        run: semgrep scan --config="p/security-audit" --sarif --output=reports/semgrep-results.sarif || true
+        run: semgrep scan --config="p/security-audit" --sarif --output=reports/semgrep-results.sarif --error --severity ERROR
 
       # 2. Trivy 輸出 SARIF
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
 
+      # 顯示 log
+      - name: Show Trivy Findings
+        run: trivy fs --scanners vuln,secret,config --format table --severity HIGH,CRITICAL . || true
+
       - name: Run Trivy SCA
-        run: trivy fs --format sarif --output reports/trivy-results.sarif .
+        run: trivy fs --scanners vuln,secret,config --format sarif --output reports/trivy-results.sarif --exit-code 1 --severity HIGH,CRITICAL .
 
       # 3. SARIF 存檔
       - name: Upload SARIF Artifacts
