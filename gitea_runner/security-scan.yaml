@@ -1,0 +1,181 @@
+# 存放於專案內 ./github/workflows/security-scan.yaml 搭配 act_runner 使用
+
+name: Security Scan
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: security
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Gitleaks 需完整歷史
+
+      # 掃描工具由 act_runner 安裝
+      - name: Verify Tools
+        run: |
+          echo "== 工具版本 =="
+          trivy --version 2>&1 | head -1 || true
+          semgrep --version 2>&1 | head -1 || true
+          command -v trivy >/dev/null || { echo "ERROR: trivy 未安裝"; exit 1; }
+          command -v semgrep >/dev/null || { echo "ERROR: semgrep 未安裝"; exit 1; }
+
+      # 有新版只提示，不安裝（版本由 act_runner 映像統一管理）
+      - name: Check Tool Updates
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          auth=()
+          if [[ "${GITHUB_TOKEN:-}" =~ ^(ghp_|github_pat_|gho_|ghu_|ghs_|ghr_) ]]; then
+            auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+          fi
+          latest() {
+            curl -sfL --max-time 10 -H "Accept: application/vnd.github+json" "${auth[@]}" \
+              "https://api.github.com/repos/$1/$2/releases/latest" 2>/dev/null \
+              | grep -oP '"tag_name"\s*:\s*"v?\K[^"]+' || echo ""
+          }
+          check() {
+            local name="$1" cur="$2" lat="$3" cov="$4" status
+            if [[ -z "$cur" ]]; then
+              echo "[MISS] $name 未安裝 → 重 build compose 映像"
+              status="MISS"
+            elif [[ -n "$lat" && "$lat" != "$cur" ]]; then
+              echo "[UPDATE] $name 有新版：$cur -> $lat"
+              status="UPDATE"
+            else
+              echo "[ OK ] $name 已安裝 ($cur)"
+              status="OK"
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\n' "$name" "${cur:-—}" "${lat:-—}" "$status" "$cov" >> /tmp/tool_versions.tsv
+          }
+          check "Trivy" "$(trivy --version 2>/dev/null | head -1 | grep -oP '[\d.]+' | head -1)" "$(latest aquasecurity trivy)" "CVE、SECRET、MISCONFIG"
+          check "Semgrep" "$(semgrep --version 2>/dev/null | grep -oP '[\d.]+' | head -1)" "$(latest semgrep semgrep)" "SAST"
+          true
+
+      - name: Show Semgrep Findings
+        run: |
+          semgrep scan --config p/security-audit --metrics=off --exclude='reports/*' --severity ERROR || true
+
+      - name: Run Semgrep SAST
+        run: |
+          set +e
+          mkdir -p reports
+          semgrep scan --config p/security-audit --metrics=off --exclude='reports/*' --severity ERROR --sarif --output reports/semgrep-results.sarif --error .
+          echo "GATE_SEMGREP=$?" >> "$GITHUB_ENV"
+
+      - name: Show Trivy Findings
+        run: |
+          trivy fs --quiet --scanners vuln,secret,misconfig --skip-dirs reports --format table --severity HIGH,CRITICAL . || true
+
+      - name: Run Trivy SCA
+        run: |
+          set +e
+          trivy fs --quiet --scanners vuln,secret,misconfig --skip-dirs reports --format sarif --output reports/trivy-results.sarif --severity HIGH,CRITICAL --exit-code 1 .
+          echo "GATE_TRIVY=$?" >> "$GITHUB_ENV"
+
+      # 三項全過才綠燈，任一未過就紅燈
+      - name: Security Gate
+        run: |
+          fail=0
+          if [[ "${GATE_SEMGREP:-0}" != "0" ]]; then echo "[FAIL] Semgrep: 有 ERROR 發現"; fail=1; else echo "[PASS] Semgrep"; fi
+          if [[ "${GATE_TRIVY:-0}" != "0" ]]; then echo "[FAIL] Trivy: 有 HIGH/CRITICAL（弱點或密碼外洩）"; fail=1; else echo "[PASS] Trivy"; fi
+          [[ "$fail" == "0" ]] && echo "全部通過" || { echo "門禁未通過"; exit 1; }
+
+      # 三份 SARIF 合成一份 HTML（交付客戶用，純標準庫、離線可跑）
+      - name: Build HTML Report
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import json, glob, html, os
+          from datetime import datetime, timezone, timedelta
+          try:
+              from zoneinfo import ZoneInfo
+              TZ = ZoneInfo("Asia/Taipei")
+          except Exception:
+              TZ = timezone(timedelta(hours=8))  # UTC+8
+          rows = []
+          for path in sorted(glob.glob('reports/*.sarif')):
+              name = os.path.basename(path)
+              try:
+                  with open(path, encoding='utf-8') as f:
+                      data = json.load(f)
+              except Exception as e:
+                  rows.append(('—', name, '—', '報告無法解析：%s' % e, '', ''))
+                  continue
+              found = False
+              tool = name
+              for run in data.get('runs', []):
+                  t = run.get('tool', {}).get('driver', {}).get('name', '')
+                  if t:
+                      tool = t
+                  for r in run.get('results', []):
+                      found = True
+                      locs = r.get('locations') or []
+                      loc = ''
+                      if locs:
+                          pl = locs[0].get('physicalLocation', {})
+                          uri = pl.get('artifactLocation', {}).get('uri', '')
+                          line = pl.get('region', {}).get('startLine', '')
+                          loc = '%s:%s' % (uri, line) if uri else ''
+                      pf = r.get('partialFingerprints') or {}
+                      fp = next(iter(pf.values()), '') if isinstance(pf, dict) else ''
+                      rows.append((tool, r.get('ruleId', ''), r.get('level', '') or '未分級',
+                                   (r.get('message') or {}).get('text', ''), loc, fp))
+              if not found:
+                  rows.append((tool, '', '', '[PASS] 檢查通過', '', ''))
+          def esc(s):
+              return html.escape(str(s or ''))
+          trs = '\n'.join(
+              '<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % tuple(esc(c) for c in row)
+              for row in rows
+          )
+          tools = []
+          try:
+              with open('/tmp/tool_versions.tsv', encoding='utf-8') as f:
+                  for line in f:
+                      p = line.rstrip('\n').split('\t')
+                      if len(p) == 5:
+                          tools.append(p)
+          except OSError:
+              pass
+          _st = {'MISS': '未安裝', 'UPDATE': '有新版', 'OK': '已安裝'}
+          ttrs = '\n'.join(
+              '<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
+                  esc(t[0]), esc(t[1]), esc(t[2]), esc(_st.get(t[3], t[3])), esc(t[4]))
+              for t in tools
+          ) or '<tr><td colspan="5">無工具版本紀錄</td></tr>'
+          now = datetime.now(TZ).strftime('%Y-%m-%d %H:%M %Z')
+          doc = '''<!DOCTYPE html>
+          <html lang="zh-Hant"><head><meta charset="utf-8">
+          <title>Security Scan Report</title>
+          <style>body{font-family:sans-serif;margin:2em}table{border-collapse:collapse;width:100%%}th,td{border:1px solid #ccc;padding:6px 8px;text-align:left}th{background:#f0f0f0}.meta{color:#555}td{word-break:break-all}</style>
+          </head><body>
+          <h1>Security Scan Report</h1>
+          <p class="meta">產生時間：%s｜共 %d 列</p>
+          <table><tr><th>工具</th><th>規則</th><th>等級</th><th>訊息</th><th>位置</th><th>指紋</th></tr>
+          %s
+          </table>
+          <h2>備註</h2>
+          <p class="meta">掃描使用工具與版本（最新版為掃描當下查詢結果）：</p>
+          <table><tr><th>工具</th><th>已安裝版本</th><th>最新版本</th><th>狀態</th><th>檢查項目</th></tr>
+          %s
+          </table>
+          </body></html>''' % (now, len(rows), trs, ttrs)
+          with open('reports/security-report.html', 'w', encoding='utf-8') as f:
+              f.write(doc)
+          print('HTML 報告已產出，共 %d 列' % len(rows))
+          EOF
+
+      - name: Upload SARIF Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-sarif-reports
+          path: reports/
+          retention-days: 14
