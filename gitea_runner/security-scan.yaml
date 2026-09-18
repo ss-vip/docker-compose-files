@@ -1,5 +1,4 @@
 # 存放於專案內 ./github/workflows/security-scan.yaml 搭配 act_runner 使用
-
 name: Security Scan
 
 on:
@@ -14,7 +13,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Gitleaks 需完整歷史
+          fetch-depth: 0 # 保留完整 git 歷史
 
       # 掃描工具由 act_runner 安裝
       - name: Verify Tools
@@ -25,7 +24,7 @@ jobs:
           command -v trivy >/dev/null || { echo "ERROR: trivy 未安裝"; exit 1; }
           command -v semgrep >/dev/null || { echo "ERROR: semgrep 未安裝"; exit 1; }
 
-      # 有新版只提示，不安裝（版本由 act_runner 映像統一管理）
+      # 檢查新版本與提示（使用版本由 act_runner 統一管理）
       - name: Check Tool Updates
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -43,7 +42,7 @@ jobs:
           check() {
             local name="$1" cur="$2" lat="$3" cov="$4" status
             if [[ -z "$cur" ]]; then
-              echo "[MISS] $name 未安裝 → 重 build compose 映像"
+              echo "[MISS] $name 未安裝"
               status="MISS"
             elif [[ -n "$lat" && "$lat" != "$cur" ]]; then
               echo "[UPDATE] $name 有新版：$cur -> $lat"
@@ -79,15 +78,15 @@ jobs:
           trivy fs --quiet --scanners vuln,secret,misconfig --skip-dirs reports --format sarif --output reports/trivy-results.sarif --severity HIGH,CRITICAL --exit-code 1 .
           echo "GATE_TRIVY=$?" >> "$GITHUB_ENV"
 
-      # 三項全過才綠燈，任一未過就紅燈
+      # 需要兩項工具 PASS 才代表通過檢查
       - name: Security Gate
         run: |
           fail=0
           if [[ "${GATE_SEMGREP:-0}" != "0" ]]; then echo "[FAIL] Semgrep: 有 ERROR 發現"; fail=1; else echo "[PASS] Semgrep"; fi
           if [[ "${GATE_TRIVY:-0}" != "0" ]]; then echo "[FAIL] Trivy: 有 HIGH/CRITICAL（弱點或密碼外洩）"; fail=1; else echo "[PASS] Trivy"; fi
-          [[ "$fail" == "0" ]] && echo "全部通過" || { echo "門禁未通過"; exit 1; }
+          [[ "$fail" == "0" ]] && echo "全部通過" || { echo "檢查未通過"; exit 1; }
 
-      # 三份 SARIF 合成一份 HTML（交付客戶用，純標準庫、離線可跑）
+      # 合成一份 HTML 報告
       - name: Build HTML Report
         if: always()
         run: |
@@ -96,7 +95,7 @@ jobs:
           from datetime import datetime, timezone, timedelta
           try:
               from zoneinfo import ZoneInfo
-              TZ = ZoneInfo("Asia/Taipei")
+              TZ = ZoneInfo("Asia/Taipei") # 時區調整
           except Exception:
               TZ = timezone(timedelta(hours=8))  # UTC+8
           rows = []
@@ -176,6 +175,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: security-sarif-reports
+          name: security-reports
           path: reports/
           retention-days: 14
