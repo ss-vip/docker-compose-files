@@ -1,4 +1,4 @@
-# 存放於專案內 ./github/workflows/security-scan.yaml 搭配 act_runner 使用
+# Gitea 專案請放在 .github/workflows/security-scan.yaml，搭配 Gitea runner 執行。
 name: Security Scan
 
 on:
@@ -7,174 +7,222 @@ on:
 
 jobs:
   scan:
+    # Semgrep、Trivy 及 Python 由 security 標籤對應的掃描映像提供。
     runs-on: security
     timeout-minutes: 30
     steps:
       - name: Checkout code
+        id: checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # 保留完整 git 歷史
+          # 掃描目前 checkout 的檔案，不需要下載完整 Git 歷史。
+          persist-credentials: false
 
-      # 掃描工具由 act_runner 安裝
-      - name: Verify Tools
-        run: |
-          echo "== 工具版本 =="
-          trivy --version 2>&1 | head -1 || true
-          semgrep --version 2>&1 | head -1 || true
-          command -v trivy >/dev/null || { echo "ERROR: trivy 未安裝"; exit 1; }
-          command -v semgrep >/dev/null || { echo "ERROR: semgrep 未安裝"; exit 1; }
-
-      # 檢查新版本與提示（使用版本由 act_runner 統一管理）
-      - name: Check Tool Updates
+      - name: Scan and build redacted reports
+        id: scans
+        if: always()
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
         run: |
-          set +e
-          auth=()
-          if [[ "${GITHUB_TOKEN:-}" =~ ^(ghp_|github_pat_|gho_|ghu_|ghs_|ghr_) ]]; then
-            auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
-          fi
-          latest() {
-            curl -sfL --max-time 10 -H "Accept: application/vnd.github+json" "${auth[@]}" \
-              "https://api.github.com/repos/$1/$2/releases/latest" 2>/dev/null \
-              | grep -oP '"tag_name"\s*:\s*"v?\K[^"]+' || echo ""
-          }
-          check() {
-            local name="$1" cur="$2" lat="$3" cov="$4" status
-            if [[ -z "$cur" ]]; then
-              echo "[MISS] $name 未安裝"
-              status="MISS"
-            elif [[ -n "$lat" && "$lat" != "$cur" ]]; then
-              echo "[UPDATE] $name 有新版：$cur -> $lat"
-              status="UPDATE"
-            else
-              echo "[ OK ] $name 已安裝 ($cur)"
-              status="OK"
-            fi
-            printf '%s\t%s\t%s\t%s\t%s\n' "$name" "${cur:-—}" "${lat:-—}" "$status" "$cov" >> /tmp/tool_versions.tsv
-          }
-          check "Trivy" "$(trivy --version 2>/dev/null | head -1 | grep -oP '[\d.]+' | head -1)" "$(latest aquasecurity trivy)" "CVE、SECRET、MISCONFIG"
-          check "Semgrep" "$(semgrep --version 2>/dev/null | grep -oP '[\d.]+' | head -1)" "$(latest semgrep semgrep)" "SAST"
-          true
+          # 將報告存到暫存目錄，避免掃描器再掃到報告。
+          reports="$(mktemp -d)"
+          printf 'reports=%s\n' "$reports" >> "$GITHUB_OUTPUT"
+          python3 - "$reports" <<'PY'
+          import html
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          from http.client import HTTPException
+          from urllib.request import Request, urlopen
 
-      - name: Show Semgrep Findings
-        run: |
-          semgrep scan --config p/security-audit --metrics=off --exclude='reports/*' --severity ERROR || true
-
-      - name: Run Semgrep SAST
-        run: |
-          set +e
-          mkdir -p reports
-          semgrep scan --config p/security-audit --metrics=off --exclude='reports/*' --severity ERROR --sarif --output reports/semgrep-results.sarif --error .
-          echo "GATE_SEMGREP=$?" >> "$GITHUB_ENV"
-
-      - name: Show Trivy Findings
-        run: |
-          trivy fs --quiet --scanners vuln,secret,misconfig --skip-dirs reports --format table --severity HIGH,CRITICAL . || true
-
-      - name: Run Trivy SCA
-        run: |
-          set +e
-          trivy fs --quiet --scanners vuln,secret,misconfig --skip-dirs reports --format sarif --output reports/trivy-results.sarif --severity HIGH,CRITICAL --exit-code 1 .
-          echo "GATE_TRIVY=$?" >> "$GITHUB_ENV"
-
-      # 需要兩項工具 PASS 才代表通過檢查
-      - name: Security Gate
-        run: |
-          fail=0
-          if [[ "${GATE_SEMGREP:-0}" != "0" ]]; then echo "[FAIL] Semgrep: 有 ERROR 發現"; fail=1; else echo "[PASS] Semgrep"; fi
-          if [[ "${GATE_TRIVY:-0}" != "0" ]]; then echo "[FAIL] Trivy: 有 HIGH/CRITICAL（弱點或密碼外洩）"; fail=1; else echo "[PASS] Trivy"; fi
-          [[ "$fail" == "0" ]] && echo "全部通過" || { echo "檢查未通過"; exit 1; }
-
-      # 合成一份 HTML 報告
-      - name: Build HTML Report
-        if: always()
-        run: |
-          python3 - <<'EOF'
-          import json, glob, html, os
-          from datetime import datetime, timezone, timedelta
-          try:
-              from zoneinfo import ZoneInfo
-              TZ = ZoneInfo("Asia/Taipei") # 時區調整
-          except Exception:
-              TZ = timezone(timedelta(hours=8))  # UTC+8
-          rows = []
-          for path in sorted(glob.glob('reports/*.sarif')):
-              name = os.path.basename(path)
-              try:
-                  with open(path, encoding='utf-8') as f:
-                      data = json.load(f)
-              except Exception as e:
-                  rows.append(('—', name, '—', '報告無法解析：%s' % e, '', ''))
-                  continue
-              found = False
-              tool = name
-              for run in data.get('runs', []):
-                  t = run.get('tool', {}).get('driver', {}).get('name', '')
-                  if t:
-                      tool = t
-                  for r in run.get('results', []):
-                      found = True
-                      locs = r.get('locations') or []
-                      loc = ''
-                      if locs:
-                          pl = locs[0].get('physicalLocation', {})
-                          uri = pl.get('artifactLocation', {}).get('uri', '')
-                          line = pl.get('region', {}).get('startLine', '')
-                          loc = '%s:%s' % (uri, line) if uri else ''
-                      pf = r.get('partialFingerprints') or {}
-                      fp = next(iter(pf.values()), '') if isinstance(pf, dict) else ''
-                      rows.append((tool, r.get('ruleId', ''), r.get('level', '') or '未分級',
-                                   (r.get('message') or {}).get('text', ''), loc, fp))
-              if not found:
-                  rows.append((tool, '', '', '[PASS] 檢查通過', '', ''))
-          def esc(s):
-              return html.escape(str(s or ''))
-          trs = '\n'.join(
-              '<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % tuple(esc(c) for c in row)
-              for row in rows
+          reports = Path(sys.argv[1])
+          # 依序執行靜態分析、相依套件與設定檢查，以及獨立的憑證掃描。
+          scans = (
+              ("Semgrep SAST", "semgrep-results.sarif", [
+                  "semgrep", "scan", "--config", "p/security-audit",
+                  "--metrics=off", "--severity", "ERROR", "--strict", "--sarif", ".",
+              ]),
+              ("Trivy SCA / misconfiguration", "trivy-results.sarif", [
+                  "trivy", "fs", "--quiet", "--scanners", "vuln,misconfig",
+                  "--severity", "HIGH,CRITICAL", "--format", "sarif", ".",
+              ]),
+              ("Trivy secret scan", "secret-results.json", [
+                  "trivy", "fs", "--quiet", "--scanners", "secret", "--format", "json", ".",
+              ]),
           )
-          tools = []
-          try:
-              with open('/tmp/tool_versions.tsv', encoding='utf-8') as f:
-                  for line in f:
-                      p = line.rstrip('\n').split('\t')
-                      if len(p) == 5:
-                          tools.append(p)
-          except OSError:
-              pass
-          _st = {'MISS': '未安裝', 'UPDATE': '有新版', 'OK': '已安裝'}
-          ttrs = '\n'.join(
-              '<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
-                  esc(t[0]), esc(t[1]), esc(t[2]), esc(_st.get(t[3], t[3])), esc(t[4]))
-              for t in tools
-          ) or '<tr><td colspan="5">無工具版本紀錄</td></tr>'
-          now = datetime.now(TZ).strftime('%Y-%m-%d %H:%M %Z')
-          doc = '''<!DOCTYPE html>
-          <html lang="zh-Hant"><head><meta charset="utf-8">
-          <title>Security Scan Report</title>
-          <style>body{font-family:sans-serif;margin:2em}table{border-collapse:collapse;width:100%%}th,td{border:1px solid #ccc;padding:6px 8px;text-align:left}th{background:#f0f0f0}.meta{color:#555}td{word-break:break-all}</style>
-          </head><body>
-          <h1>Security Scan Report</h1>
-          <p class="meta">產生時間：%s｜共 %d 列</p>
-          <table><tr><th>工具</th><th>規則</th><th>等級</th><th>訊息</th><th>位置</th><th>指紋</th></tr>
-          %s
-          </table>
-          <h2>備註</h2>
-          <p class="meta">掃描使用工具與版本（最新版為掃描當下查詢結果）：</p>
-          <table><tr><th>工具</th><th>已安裝版本</th><th>最新版本</th><th>狀態</th><th>檢查項目</th></tr>
-          %s
-          </table>
-          </body></html>''' % (now, len(rows), trs, ttrs)
-          with open('reports/security-report.html', 'w', encoding='utf-8') as f:
-              f.write(doc)
-          print('HTML 報告已產出，共 %d 列' % len(rows))
-          EOF
 
-      - name: Upload SARIF Artifacts
-        if: always()
+          # SARIF 只保留規則、等級及位置，避免輸出原始訊息或程式碼片段。
+          def redacted_sarif(data, scanner):
+              runs = data["runs"]
+              if not isinstance(runs, list) or not runs:
+                  raise ValueError("missing SARIF runs")
+              findings = []
+              for run in runs:
+                  for result in run.get("results", []):
+                      finding = {
+                          "ruleId": result["ruleId"],
+                          "message": {"text": "Finding reported by " + scanner},
+                      }
+                      if result.get("level") in {"none", "note", "warning", "error"}:
+                          finding["level"] = result["level"]
+                      locations = []
+                      for location in result.get("locations", []):
+                          physical = location.get("physicalLocation", {})
+                          uri = physical.get("artifactLocation", {}).get("uri")
+                          if not uri:
+                              continue
+                          safe = {"artifactLocation": {"uri": uri}}
+                          line = physical.get("region", {}).get("startLine")
+                          if isinstance(line, int) and line > 0:
+                              safe["region"] = {"startLine": line}
+                          locations.append({"physicalLocation": safe})
+                      if locations:
+                          finding["locations"] = locations
+                      findings.append(finding)
+              report = {"version": "2.1.0", "runs": [{
+                  "tool": {"driver": {"name": scanner}}, "results": findings,
+              }]}
+              return report, len(findings)
+
+          def run_scan(scanner, filename, command):
+              if os.environ.get("CHECKOUT_OUTCOME") != "success":
+                  return "INCOMPLETE (checkout failed)"
+              try:
+                  proc = subprocess.run(
+                      command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                      timeout=360, check=False,
+                  )
+                  if proc.returncode:
+                      return f"INCOMPLETE (scanner exit {proc.returncode})"
+                  data = json.loads(proc.stdout)
+                  if filename.endswith(".sarif"):
+                      report, count = redacted_sarif(data, scanner)
+                  else:
+                      if not isinstance(data.get("SchemaVersion"), int) or "ArtifactType" not in data:
+                          raise ValueError("invalid Trivy report")
+                      count = sum(len(target.get("Secrets") or []) for target in data.get("Results") or [])
+                      # 憑證報告只留筆數，原值與位置都不寫入附件。
+                      report = {"finding_count": count, "credential_values": "[REDACTED]"}
+                  (reports / filename).write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+              except subprocess.TimeoutExpired:
+                  return "INCOMPLETE (scanner timed out)"
+              except FileNotFoundError:
+                  return "INCOMPLETE (scanner unavailable)"
+              except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                  return "INCOMPLETE (report unavailable or invalid)"
+              if count and filename == "secret-results.json":
+                  print(f"::warning title=Possible credential exposure::{count} finding(s); values redacted.")
+              return f"FINDINGS ({count})" if count else "COMPLETE (no findings)"
+
+          def version_tuple(value):
+              match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value.strip(), re.ASCII)
+              return tuple(map(int, match.groups())) if match else None
+
+          # 版本由掃描映像統一管理，這裡只記錄實際版本並提示新版。
+          def tool_version(name, command, upstream):
+              installed = None
+              latest = None
+              try:
+                  probe = subprocess.run(
+                      [command, "--version"], stdout=subprocess.PIPE,
+                      stderr=subprocess.DEVNULL, timeout=5, check=False,
+                      env={**os.environ, "SEMGREP_ENABLE_VERSION_CHECK": "0"},
+                  )
+                  if probe.returncode == 0:
+                      for line in probe.stdout.decode("utf-8", errors="replace").splitlines():
+                          installed = version_tuple(line.removeprefix("Version:").strip())
+                          if installed:
+                              break
+              except (OSError, subprocess.TimeoutExpired, ValueError):
+                  pass
+              try:
+                  request = Request(
+                      f"https://api.github.com/repos/{upstream}/releases/latest",
+                      headers={"Accept": "application/vnd.github+json", "User-Agent": "gitea-security-scan"},
+                  )
+                  with urlopen(request, timeout=5) as response:
+                      # Trivy 的 release 可能附有大量檔案，回應會超過 64 KiB。
+                      limit = 1024 * 1024
+                      payload = response.read(limit + 1)
+                  if len(payload) > limit:
+                      raise ValueError("release response exceeds size limit")
+                  release = json.loads(payload)
+                  latest = version_tuple(release["tag_name"])
+              except (OSError, HTTPException, ValueError, KeyError, TypeError, AttributeError):
+                  pass
+
+              installed_text = ".".join(map(str, installed)) if installed else "無法確認實際版本"
+              line = f"{name} 實際版本：{installed_text}"
+              if latest is None:
+                  return f"{line}｜無法確認最新版"
+              latest_text = ".".join(map(str, latest))
+              if installed is not None and latest > installed:
+                  return f"{line}｜有新版：{latest_text}"
+              return f"{line}｜官方最新版：{latest_text}"
+
+          descriptions = {
+              "Semgrep SAST": "靜態分析原始碼，找出符合安全規則的高風險寫法（ERROR）。",
+              "Trivy SCA / misconfiguration": "檢查相依套件已知弱點與基礎設施設定錯誤（HIGH、CRITICAL）。",
+              "Trivy secret scan": "檢查目前檔案中的疑似 token、密碼與私鑰。報告只保留筆數。",
+          }
+          lines = []
+          scan_rows = []
+          for scanner, filename, command in scans:
+              status = run_scan(scanner, filename, command)
+              line = f"{scanner}: {status}"
+              print(line)
+              lines.append(line)
+              scan_rows.append((scanner, descriptions[scanner], status))
+
+          versions = [
+              tool_version("Semgrep", "semgrep", "semgrep/semgrep"),
+              tool_version("Trivy", "trivy", "aquasecurity/trivy"),
+          ]
+          for version in versions:
+              print(version)
+          summary = "\n".join(lines + ["", "工具版本", *versions]) + "\n"
+          (reports / "scan-status.txt").write_text(summary, encoding="utf-8")
+          # 合成 HTML 表格。執行時間可在 Gitea Actions 頁面查看。
+          def table(headers, rows):
+              headings = "".join(f'<th scope="col">{html.escape(value)}</th>' for value in headers)
+              body = []
+              for row in rows:
+                  cells = "".join(f"<td>{html.escape(value)}</td>" for value in row)
+                  body.append(f"<tr>{cells}</tr>")
+              return f"<table><thead><tr>{headings}</tr></thead><tbody>{''.join(body)}</tbody></table>"
+
+          version_rows = [version.split("｜", 1) for version in versions]
+          report_html = (
+              '<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">'
+              '<meta name="viewport" content="width=device-width, initial-scale=1">'
+              '<title>Security Scan Report</title>'
+              '<style>body{font-family:system-ui,sans-serif;margin:1.5rem;line-height:1.5}'
+              'table{border-collapse:collapse;width:100%;max-width:72rem;margin-bottom:1.5rem}'
+              'th,td{border:1px solid #cbd5e1;padding:.55rem .75rem;text-align:left;vertical-align:top}'
+              'th{background:#e2e8f0;color:#0f172a}td{overflow-wrap:anywhere}</style></head>'
+              '<body><h1>Security Scan Report</h1><h2>掃描結果</h2>'
+              + table(("掃描項目", "檢查內容", "結果"), scan_rows)
+              + '<p>COMPLETE 表示掃描完成且沒有發現；FINDINGS 表示有發現；'
+              'INCOMPLETE 表示掃描未完成。</p>'
+              '<h2>工具版本</h2>'
+              + table(("工具與實際版本", "新版查詢"), version_rows)
+              + '</body></html>'
+          )
+          (reports / "security-report.html").write_text(report_html, encoding="utf-8")
+          # 有發現只作提示，任何一項未完成才將這次掃描標示為失敗。
+          if any(": INCOMPLETE" in line for line in lines):
+              sys.exit(1)
+          PY
+
+      # 即使掃描未完成，仍上傳已產出的 SARIF、憑證摘要及狀態報告。
+      - name: Upload security reports
+        if: ${{ always() && steps.scans.outputs.reports != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: security-reports
-          path: reports/
+          path: ${{ steps.scans.outputs.reports }}
+          if-no-files-found: error
           retention-days: 14
