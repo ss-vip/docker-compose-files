@@ -1,16 +1,22 @@
 # 首次部署：先設定 Gitea 位址與註冊 token，再執行指令 docker compose build scanner && docker compose up -d
+networks:
+  gitea:
+    name: gitea_net
+    external: true
+
 services:
   runner:
     container_name: gitea_runner
-    image: gitea/runner:3.0.0
+    build: .
     restart: always
+    networks:
+      - gitea
     volumes:
       - ./data:/data
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      # Gitea 主機與 Actions Runner 註冊 token。
-      - GITEA_INSTANCE_URL=http://GITEA_HOST:3000
-      - GITEA_RUNNER_REGISTRATION_TOKEN=REPLACE_WITH_RUNNER_REGISTRATION_TOKEN
+      - GITEA_INSTANCE_URL=http://gitea:3000
+      - GITEA_RUNNER_REGISTRATION_TOKEN=jD11R4awyApNUTyjEZO2x51jEDPFpAIha2kfZFYr
       - GITEA_RUNNER_LABELS=ubuntu-latest:docker://node:22-bullseye,security:docker://security-scanner:latest
 
   # security 標籤使用下列映像。只需建置映像，無須常駐啟動 scanner 服務。
@@ -20,7 +26,7 @@ services:
     build:
       context: .
       dockerfile_inline: |
-        FROM python:3.12-slim
+        FROM python:3.13-slim
         # 更新版本：改版號後重新 build
         RUN apt-get update && apt-get install -y --no-install-recommends \
             curl git ca-certificates \
@@ -32,9 +38,9 @@ services:
             && chmod +x /usr/local/bin/trivy \
             && rm /tmp/trivy.tar.gz
         RUN trivy image --download-db-only
-        RUN pip install --no-cache-dir "setuptools<81" "semgrep==1.184.0" \
+        RUN pip install --no-cache-dir "setuptools<81" "semgrep==1.185.0" \
             && semgrep --version
-        RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+        RUN curl -fsSL https://deb.nodesource.com/setup_26.x | bash - \
             && apt-get install -y --no-install-recommends nodejs \
             && rm -rf /var/lib/apt/lists/*
         WORKDIR /workspace

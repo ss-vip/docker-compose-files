@@ -1,12 +1,11 @@
-version: "3"
-
 networks:
   gitea:
+    name: gitea_net
     external: false
 
 services:
   gitea:
-    image: docker.io/gitea/gitea:1.23.1
+    image: docker.gitea.com/gitea:28.3.0
     container_name: gitea
     environment:
       - USER_UID=1000
@@ -19,5 +18,5 @@ services:
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
     ports:
-      - "3000:3000"
-      - "22:22"
+      - "9000:3000"
+      - "9022:22"

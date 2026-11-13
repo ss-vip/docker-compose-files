@@ -10,13 +10,11 @@ docker-compose up -d
 ```
 
 ### 各資料夾內 yml 檔案分別為：
-- gitea: [Gitea](https://docs.gitea.com/zh-tw/) 1.23.1
+- gitea: [Gitea](https://docs.gitea.com/zh-tw/)
 - gitea_runner: [Gitea Action Runner](https://docs.gitea.com/zh-tw/usage/actions/act-runner)
 - jenkins: [Jenkins](https://github.com/jenkinsci/docker)
-- php_apache: PHP 7.4 & Apache
 - mariadb: MariaDB
 - crontab-ui: [Crontab-ui](https://github.com/alseambusher/crontab-ui)
-- n8n: [n8n](https://github.com/n8n-io/n8n)
 
 ---
 
